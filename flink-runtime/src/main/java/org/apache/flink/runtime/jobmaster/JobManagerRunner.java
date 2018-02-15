@@ -21,9 +21,11 @@ package org.apache.flink.runtime.jobmaster;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.time.Time;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.runtime.blob.BlobServer;
 import org.apache.flink.runtime.client.JobExecutionException;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
-import org.apache.flink.runtime.execution.librarycache.BlobLibraryCacheManager;
+import org.apache.flink.runtime.execution.librarycache.LibraryCacheManager;
+import org.apache.flink.runtime.executiongraph.ArchivedExecutionGraph;
 import org.apache.flink.runtime.heartbeat.HeartbeatServices;
 import org.apache.flink.runtime.highavailability.HighAvailabilityServices;
 import org.apache.flink.runtime.highavailability.RunningJobsRegistry;
@@ -82,7 +84,7 @@ public class JobManagerRunner implements LeaderContender, OnCompletionActions, F
 	/** Leader election for this job. */
 	private final LeaderElectionService leaderElectionService;
 
-	private final JobManagerServices jobManagerServices;
+	private final JobManagerSharedServices jobManagerSharedServices;
 
 	private final JobMaster jobManager;
 
@@ -99,7 +101,7 @@ public class JobManagerRunner implements LeaderContender, OnCompletionActions, F
 	 * Exceptions that occur while creating the JobManager or JobManagerRunner are directly
 	 * thrown and not reported to the given {@code FatalErrorHandler}.
 	 *
-	 * <p>This JobManagerRunner assumes that it owns the given {@code JobManagerServices}.
+	 * <p>This JobManagerRunner assumes that it owns the given {@code JobManagerSharedServices}.
 	 * It will shut them down on error and on calls to {@link #shutdown()}.
 	 *
 	 * @throws Exception Thrown if the runner cannot be set up, because either one of the
@@ -112,7 +114,8 @@ public class JobManagerRunner implements LeaderContender, OnCompletionActions, F
 			final RpcService rpcService,
 			final HighAvailabilityServices haServices,
 			final HeartbeatServices heartbeatServices,
-			final JobManagerServices jobManagerServices,
+			final BlobServer blobServer,
+			final JobManagerSharedServices jobManagerSharedServices,
 			final MetricRegistry metricRegistry,
 			final OnCompletionActions toNotifyOnComplete,
 			final FatalErrorHandler errorHandler,
@@ -125,7 +128,7 @@ public class JobManagerRunner implements LeaderContender, OnCompletionActions, F
 			this.jobGraph = checkNotNull(jobGraph);
 			this.toNotifyOnComplete = checkNotNull(toNotifyOnComplete);
 			this.errorHandler = checkNotNull(errorHandler);
-			this.jobManagerServices = checkNotNull(jobManagerServices);
+			this.jobManagerSharedServices = checkNotNull(jobManagerSharedServices);
 
 			checkArgument(jobGraph.getNumberOfVertices() > 0, "The given job is empty");
 
@@ -134,7 +137,7 @@ public class JobManagerRunner implements LeaderContender, OnCompletionActions, F
 			this.jobManagerMetricGroup = jobManagerMetrics;
 
 			// libraries and class loader first
-			final BlobLibraryCacheManager libraryCacheManager = jobManagerServices.libraryCacheManager;
+			final LibraryCacheManager libraryCacheManager = jobManagerSharedServices.getLibraryCacheManager();
 			try {
 				libraryCacheManager.registerJob(
 						jobGraph.getJobID(), jobGraph.getUserJarBlobKeys(), jobGraph.getClasspaths());
@@ -151,6 +154,8 @@ public class JobManagerRunner implements LeaderContender, OnCompletionActions, F
 			this.runningJobsRegistry = haServices.getRunningJobsRegistry();
 			this.leaderElectionService = haServices.getJobManagerLeaderElectionService(jobGraph.getJobID());
 
+			this.timeout = jobManagerSharedServices.getTimeout();
+
 			// now start the JobManager
 			this.jobManager = new JobMaster(
 				rpcService,
@@ -158,20 +163,15 @@ public class JobManagerRunner implements LeaderContender, OnCompletionActions, F
 				jobGraph,
 				configuration,
 				haServices,
+				jobManagerSharedServices,
 				heartbeatServices,
-				jobManagerServices.executorService,
-				jobManagerServices.blobServer,
-				jobManagerServices.libraryCacheManager,
-				jobManagerServices.restartStrategyFactory,
-				jobManagerServices.rpcAskTimeout,
+				blobServer,
 				jobManagerMetrics,
 				this,
 				this,
 				userCodeLoader,
 				restAddress,
 				metricRegistry.getMetricQueryServicePath());
-
-			this.timeout = jobManagerServices.rpcAskTimeout;
 		}
 		catch (Throwable t) {
 			// clean up everything
@@ -251,30 +251,14 @@ public class JobManagerRunner implements LeaderContender, OnCompletionActions, F
 	 * Job completion notification triggered by JobManager.
 	 */
 	@Override
-	public void jobFinished(JobResult result) {
+	public void jobReachedGloballyTerminalState(ArchivedExecutionGraph executionGraph) {
 		try {
 			unregisterJobFromHighAvailability();
 			shutdownInternally();
 		}
 		finally {
 			if (toNotifyOnComplete != null) {
-				toNotifyOnComplete.jobFinished(result);
-			}
-		}
-	}
-
-	/**
-	 * Job completion notification triggered by JobManager.
-	 */
-	@Override
-	public void jobFailed(JobResult result) {
-		try {
-			unregisterJobFromHighAvailability();
-			shutdownInternally();
-		}
-		finally {
-			if (toNotifyOnComplete != null) {
-				toNotifyOnComplete.jobFailed(result);
+				toNotifyOnComplete.jobReachedGloballyTerminalState(executionGraph);
 			}
 		}
 	}
@@ -391,7 +375,7 @@ public class JobManagerRunner implements LeaderContender, OnCompletionActions, F
 								onFatalError(new Exception("Could not start the job manager.", throwable));
 							}
 						},
-						jobManagerServices.executorService);
+						jobManagerSharedServices.getScheduledExecutorService());
 				} catch (Exception e) {
 					onFatalError(new Exception("Could not start the job manager.", e));
 				}
@@ -418,7 +402,7 @@ public class JobManagerRunner implements LeaderContender, OnCompletionActions, F
 						onFatalError(new Exception("Could not start the job manager.", throwable));
 					}
 				},
-				jobManagerServices.executorService);
+				jobManagerSharedServices.getScheduledExecutorService());
 		}
 	}
 

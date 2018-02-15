@@ -27,9 +27,8 @@ import org.apache.flink.runtime.blob.VoidBlobStore;
 import org.apache.flink.runtime.checkpoint.StandaloneCheckpointRecoveryFactory;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.concurrent.ScheduledExecutor;
-import org.apache.flink.runtime.execution.librarycache.BlobLibraryCacheManager;
 import org.apache.flink.runtime.execution.librarycache.FlinkUserCodeClassLoaders;
-import org.apache.flink.runtime.executiongraph.restart.NoRestartStrategy;
+import org.apache.flink.runtime.executiongraph.ArchivedExecutionGraph;
 import org.apache.flink.runtime.heartbeat.HeartbeatServices;
 import org.apache.flink.runtime.heartbeat.TestingHeartbeatServices;
 import org.apache.flink.runtime.highavailability.TestingHighAvailabilityServices;
@@ -54,11 +53,13 @@ import org.junit.experimental.categories.Category;
 
 import java.net.URL;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 
+/**
+ * Tests for {@link JobMaster}.
+ */
 @Category(Flip6.class)
 public class JobMasterTest extends TestLogger {
 
@@ -100,6 +101,11 @@ public class JobMasterTest extends TestLogger {
 		final JobGraph jobGraph = new JobGraph();
 
 		Configuration configuration = new Configuration();
+
+		final JobManagerSharedServices jobManagerSharedServices = new TestingJobManagerSharedServicesBuilder()
+			.setTimeout(testingTimeout)
+			.build();
+
 		try (BlobServer blobServer = new BlobServer(configuration, new VoidBlobStore())) {
 			blobServer.start();
 
@@ -109,15 +115,9 @@ public class JobMasterTest extends TestLogger {
 				jobGraph,
 				configuration,
 				haServices,
+				jobManagerSharedServices,
 				heartbeatServices,
-				Executors.newScheduledThreadPool(1),
 				blobServer,
-				new BlobLibraryCacheManager(
-					blobServer,
-					FlinkUserCodeClassLoaders.ResolveOrder.CHILD_FIRST,
-					new String[0]),
-				new NoRestartStrategy.NoRestartStrategyFactory(),
-				testingTimeout,
 				null,
 				new NoOpOnCompletionActions(),
 				testingFatalErrorHandler,
@@ -139,8 +139,6 @@ public class JobMasterTest extends TestLogger {
 			// wait for the completion of the registration
 			registrationResponse.get();
 
-			System.out.println("foobar");
-
 			final ResourceID heartbeatResourceId = heartbeatResourceIdFuture.get(testingTimeout.toMilliseconds(), TimeUnit.MILLISECONDS);
 
 			assertThat(heartbeatResourceId, Matchers.equalTo(jmResourceId));
@@ -153,6 +151,7 @@ public class JobMasterTest extends TestLogger {
 			testingFatalErrorHandler.rethrowError();
 
 		} finally {
+			jobManagerSharedServices.shutdown();
 			rpc.stopService();
 		}
 	}
@@ -204,6 +203,11 @@ public class JobMasterTest extends TestLogger {
 		final TestingFatalErrorHandler testingFatalErrorHandler = new TestingFatalErrorHandler();
 
 		Configuration configuration = new Configuration();
+
+		final JobManagerSharedServices jobManagerSharedServices = new TestingJobManagerSharedServicesBuilder()
+			.setTimeout(testingTimeout)
+			.build();
+
 		try (BlobServer blobServer = new BlobServer(configuration, new VoidBlobStore())) {
 			blobServer.start();
 
@@ -213,15 +217,9 @@ public class JobMasterTest extends TestLogger {
 				jobGraph,
 				configuration,
 				haServices,
+				jobManagerSharedServices,
 				heartbeatServices,
-				Executors.newScheduledThreadPool(1),
 				blobServer,
-				new BlobLibraryCacheManager(
-					blobServer,
-					FlinkUserCodeClassLoaders.ResolveOrder.CHILD_FIRST,
-					new String[0]),
-				new NoRestartStrategy.NoRestartStrategyFactory(),
-				testingTimeout,
 				null,
 				new NoOpOnCompletionActions(),
 				testingFatalErrorHandler,
@@ -255,6 +253,7 @@ public class JobMasterTest extends TestLogger {
 			testingFatalErrorHandler.rethrowError();
 
 		} finally {
+			jobManagerSharedServices.shutdown();
 			rpc.stopService();
 		}
 	}
@@ -265,12 +264,7 @@ public class JobMasterTest extends TestLogger {
 	private static final class NoOpOnCompletionActions implements OnCompletionActions {
 
 		@Override
-		public void jobFinished(final JobResult result) {
-
-		}
-
-		@Override
-		public void jobFailed(final JobResult result) {
+		public void jobReachedGloballyTerminalState(ArchivedExecutionGraph executionGraph) {
 
 		}
 

@@ -1268,6 +1268,9 @@ class JobManager(
             true
         }
 
+        val allocationTimeout: Long = flinkConfiguration.getLong(
+          JobManagerOptions.SLOT_REQUEST_TIMEOUT)
+
         executionGraph = ExecutionGraphBuilder.buildGraph(
           executionGraph,
           jobGraph,
@@ -1282,6 +1285,7 @@ class JobManager(
           jobMetrics,
           numSlots,
           blobServer,
+          Time.milliseconds(allocationTimeout),
           log.logger)
         
         if (registerNewGraph) {
@@ -1727,7 +1731,10 @@ class JobManager(
           }(context.dispatcher))
 
           try {
-            archive ! decorateMessage(ArchiveExecutionGraph(jobID, eg.archive()))
+            archive ! decorateMessage(
+              ArchiveExecutionGraph(
+                jobID,
+                ArchivedExecutionGraph.createFrom(eg)))
           } catch {
             case t: Throwable => log.warn(s"Could not archive the execution graph $eg.", t)
           }

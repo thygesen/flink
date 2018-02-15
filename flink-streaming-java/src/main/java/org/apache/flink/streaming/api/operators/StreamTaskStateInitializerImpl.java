@@ -23,12 +23,10 @@ import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.core.fs.CloseableRegistry;
 import org.apache.flink.core.fs.FSDataInputStream;
-import org.apache.flink.core.memory.DataInputViewStreamWrapper;
 import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
 import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.state.AbstractKeyedStateBackend;
-import org.apache.flink.runtime.state.CheckpointStreamFactory;
 import org.apache.flink.runtime.state.DefaultOperatorStateBackend;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
@@ -127,8 +125,7 @@ public class StreamTaskStateInitializerImpl implements StreamTaskStateInitialize
 		OperatorStateBackend operatorStateBackend = null;
 		CloseableIterable<KeyGroupStatePartitionStreamProvider> rawKeyedStateInputs = null;
 		CloseableIterable<StatePartitionStreamProvider> rawOperatorStateInputs = null;
-		CheckpointStreamFactory checkpointStreamFactory = null;
-		InternalTimeServiceManager<?, ?> timeServiceManager = null;
+		InternalTimeServiceManager<?, ?> timeServiceManager;
 
 		try {
 
@@ -152,9 +149,6 @@ public class StreamTaskStateInitializerImpl implements StreamTaskStateInitialize
 			rawOperatorStateInputs = rawOperatorStateInputs(operatorSubtaskStateFromJobManager);
 			streamTaskCloseableRegistry.registerCloseable(rawOperatorStateInputs);
 
-			// -------------- Checkpoint Stream Factory --------------
-			checkpointStreamFactory = streamFactory(operatorIdentifierText);
-
 			// -------------- Internal Timer Service Manager --------------
 			timeServiceManager = internalTimeServiceManager(keyedStatedBackend, keyContext, rawKeyedStateInputs);
 
@@ -166,8 +160,7 @@ public class StreamTaskStateInitializerImpl implements StreamTaskStateInitialize
 				keyedStatedBackend,
 				timeServiceManager,
 				rawOperatorStateInputs,
-				rawKeyedStateInputs,
-				checkpointStreamFactory);
+				rawKeyedStateInputs);
 		} catch (Exception ex) {
 
 			// cleanup if something went wrong before results got published.
@@ -220,7 +213,7 @@ public class StreamTaskStateInitializerImpl implements StreamTaskStateInitialize
 				"Key Group " + keyGroupIdx + " does not belong to the local range.");
 
 			timeServiceManager.restoreStateForKeyGroup(
-				new DataInputViewStreamWrapper(streamProvider.getStream()),
+				streamProvider.getStream(),
 				keyGroupIdx, environment.getUserClassLoader());
 		}
 
@@ -257,10 +250,6 @@ public class StreamTaskStateInitializerImpl implements StreamTaskStateInitialize
 			operatorIdentifierText,
 			operatorSubtaskStateFromJobManager,
 			backendCloseableRegistry);
-	}
-
-	protected CheckpointStreamFactory streamFactory(String operatorIdentifierText) throws IOException {
-		return stateBackend.createStreamFactory(environment.getJobID(), operatorIdentifierText);
 	}
 
 	protected CloseableIterable<StatePartitionStreamProvider> rawOperatorStateInputs(
@@ -589,16 +578,13 @@ public class StreamTaskStateInitializerImpl implements StreamTaskStateInitialize
 		private final CloseableIterable<StatePartitionStreamProvider> rawOperatorStateInputs;
 		private final CloseableIterable<KeyGroupStatePartitionStreamProvider> rawKeyedStateInputs;
 
-		private final CheckpointStreamFactory checkpointStreamFactory;
-
 		StreamOperatorStateContextImpl(
 			boolean restored,
 			OperatorStateBackend operatorStateBackend,
 			AbstractKeyedStateBackend<?> keyedStateBackend,
 			InternalTimeServiceManager<?, ?> internalTimeServiceManager,
 			CloseableIterable<StatePartitionStreamProvider> rawOperatorStateInputs,
-			CloseableIterable<KeyGroupStatePartitionStreamProvider> rawKeyedStateInputs,
-			CheckpointStreamFactory checkpointStreamFactory) {
+			CloseableIterable<KeyGroupStatePartitionStreamProvider> rawKeyedStateInputs) {
 
 			this.restored = restored;
 			this.operatorStateBackend = operatorStateBackend;
@@ -606,7 +592,6 @@ public class StreamTaskStateInitializerImpl implements StreamTaskStateInitialize
 			this.internalTimeServiceManager = internalTimeServiceManager;
 			this.rawOperatorStateInputs = rawOperatorStateInputs;
 			this.rawKeyedStateInputs = rawKeyedStateInputs;
-			this.checkpointStreamFactory = checkpointStreamFactory;
 		}
 
 		@Override
@@ -627,11 +612,6 @@ public class StreamTaskStateInitializerImpl implements StreamTaskStateInitialize
 		@Override
 		public InternalTimeServiceManager<?, ?> internalTimerServiceManager() {
 			return internalTimeServiceManager;
-		}
-
-		@Override
-		public CheckpointStreamFactory checkpointStreamFactory() {
-			return checkpointStreamFactory;
 		}
 
 		@Override

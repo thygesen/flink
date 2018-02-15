@@ -19,12 +19,12 @@
 package org.apache.flink.runtime.executiongraph;
 
 import org.apache.flink.annotation.VisibleForTesting;
-import org.apache.flink.api.common.Archiveable;
 import org.apache.flink.api.common.ArchivedExecutionConfig;
 import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.accumulators.Accumulator;
 import org.apache.flink.api.common.accumulators.AccumulatorHelper;
+import org.apache.flink.api.common.accumulators.FailedAccumulatorSerialization;
 import org.apache.flink.api.common.time.Time;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.JobException;
@@ -51,7 +51,6 @@ import org.apache.flink.runtime.executiongraph.failover.RestartAllStrategy;
 import org.apache.flink.runtime.executiongraph.restart.ExecutionGraphRestartCallback;
 import org.apache.flink.runtime.executiongraph.restart.RestartCallback;
 import org.apache.flink.runtime.executiongraph.restart.RestartStrategy;
-import org.apache.flink.runtime.jobmaster.slotpool.SlotProvider;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
 import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
 import org.apache.flink.runtime.jobgraph.JobStatus;
@@ -62,6 +61,7 @@ import org.apache.flink.runtime.jobgraph.tasks.CheckpointCoordinatorConfiguratio
 import org.apache.flink.runtime.jobmanager.scheduler.CoLocationGroup;
 import org.apache.flink.runtime.jobmanager.scheduler.LocationPreferenceConstraint;
 import org.apache.flink.runtime.jobmanager.scheduler.NoResourceAvailableException;
+import org.apache.flink.runtime.jobmaster.slotpool.SlotProvider;
 import org.apache.flink.runtime.query.KvStateLocationRegistry;
 import org.apache.flink.runtime.state.SharedStateRegistry;
 import org.apache.flink.runtime.state.StateBackend;
@@ -95,7 +95,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
@@ -148,7 +148,7 @@ import static org.apache.flink.util.Preconditions.checkState;
  * local failover (meaning there is a concurrent global failover), the failover strategy has to
  * yield before the global failover.
  */
-public class ExecutionGraph implements AccessExecutionGraph, Archiveable<ArchivedExecutionGraph> {
+public class ExecutionGraph implements AccessExecutionGraph {
 
 	/** In place updater for the execution graph's current state. Avoids having to use an
 	 * AtomicReference and thus makes the frequent read access a bit faster */
@@ -213,11 +213,10 @@ public class ExecutionGraph implements AccessExecutionGraph, Archiveable<Archive
 	private final long[] stateTimestamps;
 
 	/** The timeout for all messages that require a response/acknowledgement */
-	private final Time rpcCallTimeout;
+	private final Time rpcTimeout;
 
-	/** The timeout for bulk slot allocation (eager scheduling mode). After this timeout,
-	 * slots are released and a recovery is triggered */
-	private final Time scheduleAllocationTimeout;
+	/** The timeout for slot allocations. */
+	private final Time allocationTimeout;
 
 	/** Strategy to use for restarts */
 	private final RestartStrategy restartStrategy;
@@ -356,19 +355,21 @@ public class ExecutionGraph implements AccessExecutionGraph, Archiveable<Archive
 			failoverStrategy,
 			slotProvider,
 			ExecutionGraph.class.getClassLoader(),
-			VoidBlobWriter.getInstance());
+			VoidBlobWriter.getInstance(),
+			timeout);
 	}
 
 	public ExecutionGraph(
 			JobInformation jobInformation,
 			ScheduledExecutorService futureExecutor,
 			Executor ioExecutor,
-			Time timeout,
+			Time rpcTimeout,
 			RestartStrategy restartStrategy,
 			FailoverStrategy.Factory failoverStrategyFactory,
 			SlotProvider slotProvider,
 			ClassLoader userClassLoader,
-			BlobWriter blobWriter) throws IOException {
+			BlobWriter blobWriter,
+			Time allocationTimeout) throws IOException {
 
 		checkNotNull(futureExecutor);
 
@@ -395,8 +396,8 @@ public class ExecutionGraph implements AccessExecutionGraph, Archiveable<Archive
 		this.stateTimestamps = new long[JobStatus.values().length];
 		this.stateTimestamps[JobStatus.CREATED.ordinal()] = System.currentTimeMillis();
 
-		this.rpcCallTimeout = checkNotNull(timeout);
-		this.scheduleAllocationTimeout = checkNotNull(timeout);
+		this.rpcTimeout = checkNotNull(rpcTimeout);
+		this.allocationTimeout = checkNotNull(allocationTimeout);
 
 		this.restartStrategy = restartStrategy;
 		this.kvStateLocationRegistry = new KvStateLocationRegistry(jobInformation.getJobId(), getAllVertices());
@@ -437,6 +438,10 @@ public class ExecutionGraph implements AccessExecutionGraph, Archiveable<Archive
 
 	public ScheduleMode getScheduleMode() {
 		return scheduleMode;
+	}
+
+	public Time getAllocationTimeout() {
+		return allocationTimeout;
 	}
 
 	@Override
@@ -761,16 +766,27 @@ public class ExecutionGraph implements AccessExecutionGraph, Archiveable<Archive
 	/**
 	 * Gets a serialized accumulator map.
 	 * @return The accumulator map with serialized accumulator values.
-	 * @throws IOException
 	 */
 	@Override
-	public Map<String, SerializedValue<Object>> getAccumulatorsSerialized() throws IOException {
+	public Map<String, SerializedValue<Object>> getAccumulatorsSerialized() {
 
 		Map<String, Accumulator<?, ?>> accumulatorMap = aggregateUserAccumulators();
 
 		Map<String, SerializedValue<Object>> result = new HashMap<>(accumulatorMap.size());
 		for (Map.Entry<String, Accumulator<?, ?>> entry : accumulatorMap.entrySet()) {
-			result.put(entry.getKey(), new SerializedValue<>(entry.getValue().getLocalValue()));
+
+			try {
+				final SerializedValue<Object> serializedValue = new SerializedValue<>(entry.getValue().getLocalValue());
+				result.put(entry.getKey(), serializedValue);
+			} catch (IOException ioe) {
+				LOG.error("Could not serialize accumulator " + entry.getKey() + '.', ioe);
+
+				try {
+					result.put(entry.getKey(), new SerializedValue<>(new FailedAccumulatorSerialization(ioe)));
+				} catch (IOException e) {
+					throw new RuntimeException("It should never happen that we cannot serialize the accumulator serialization exception.", e);
+				}
+			}
 		}
 
 		return result;
@@ -810,7 +826,7 @@ public class ExecutionGraph implements AccessExecutionGraph, Archiveable<Archive
 				this,
 				jobVertex,
 				1,
-				rpcCallTimeout,
+				rpcTimeout,
 				globalModVersion,
 				createTimestamp);
 
@@ -850,7 +866,7 @@ public class ExecutionGraph implements AccessExecutionGraph, Archiveable<Archive
 					break;
 
 				case EAGER:
-					scheduleEager(slotProvider, scheduleAllocationTimeout);
+					scheduleEager(slotProvider, allocationTimeout);
 					break;
 
 				default:
@@ -899,59 +915,45 @@ public class ExecutionGraph implements AccessExecutionGraph, Archiveable<Archive
 			Collection<CompletableFuture<Execution>> allocationFutures = ejv.allocateResourcesForAll(
 				slotProvider,
 				queued,
-				LocationPreferenceConstraint.ALL);
+				LocationPreferenceConstraint.ALL,
+				allocationTimeout);
 
 			allAllocationFutures.addAll(allocationFutures);
 		}
 
 		// this future is complete once all slot futures are complete.
 		// the future fails once one slot future fails.
-		final ConjunctFuture<Collection<Execution>> allAllocationsComplete = FutureUtils.combineAll(allAllocationFutures);
+		final ConjunctFuture<Collection<Execution>> allAllocationsFuture = FutureUtils.combineAll(allAllocationFutures);
 
-		// make sure that we fail if the allocation timeout was exceeded
-		final ScheduledFuture<?> timeoutCancelHandle = futureExecutor.schedule(new Runnable() {
-			@Override
-			public void run() {
-				// When the timeout triggers, we try to complete the conjunct future with an exception.
-				// Note that this is a no-op if the future is already completed
-				int numTotal = allAllocationsComplete.getNumFuturesTotal();
-				int numComplete = allAllocationsComplete.getNumFuturesCompleted();
-				String message = "Could not allocate all requires slots within timeout of " +
-						timeout + ". Slots required: " + numTotal + ", slots allocated: " + numComplete;
+		allAllocationsFuture.whenCompleteAsync(
+			(Collection<Execution> allAllocations, Throwable throwable) -> {
+				if (throwable != null) {
+					final Throwable strippedThrowable = ExceptionUtils.stripCompletionException(throwable);
+					final Throwable resultThrowable;
 
-				allAllocationsComplete.completeExceptionally(new NoResourceAvailableException(message));
-			}
-		}, timeout.getSize(), timeout.getUnit());
+					if (strippedThrowable instanceof TimeoutException) {
+						int numTotal = allAllocationsFuture.getNumFuturesTotal();
+						int numComplete = allAllocationsFuture.getNumFuturesCompleted();
+						String message = "Could not allocate all requires slots within timeout of " +
+							timeout + ". Slots required: " + numTotal + ", slots allocated: " + numComplete;
 
+						resultThrowable = new NoResourceAvailableException(message);
+					} else {
+						resultThrowable = strippedThrowable;
+					}
 
-		allAllocationsComplete.handleAsync(
-			(Collection<Execution> executions, Throwable throwable) -> {
-				try {
-					// we do not need the cancellation timeout any more
-					timeoutCancelHandle.cancel(false);
-
-					if (throwable == null) {
+					failGlobal(resultThrowable);
+				} else {
+					try {
 						// successfully obtained all slots, now deploy
-						for (Execution execution : executions) {
+						for (Execution execution : allAllocations) {
 							execution.deploy();
 						}
-					}
-					else {
-						// let the exception handler deal with this
-						throw throwable;
+					} catch (Throwable t) {
+						failGlobal(new FlinkException("Could not deploy executions.", t));
 					}
 				}
-				catch (Throwable t) {
-					// we catch everything here to make sure cleanup happens and the
-					// ExecutionGraph notices the error
-					failGlobal(ExceptionUtils.stripCompletionException(t));
-				}
-
-				// Wouldn't it be nice if we could return an actual Void object?
-				// return (Void) Unsafe.getUnsafe().allocateInstance(Void.class);
-				return null;
-			},
-			futureExecutor);
+			}, futureExecutor);
 	}
 
 	public void cancel() {
@@ -1686,41 +1688,5 @@ public class ExecutionGraph implements AccessExecutionGraph, Archiveable<Archive
 				}
 			}
 		}
-	}
-
-	@Override
-	public ArchivedExecutionGraph archive() {
-		Map<JobVertexID, ArchivedExecutionJobVertex> archivedTasks = new HashMap<>(verticesInCreationOrder.size());
-		List<ArchivedExecutionJobVertex> archivedVerticesInCreationOrder = new ArrayList<>(verticesInCreationOrder.size());
-
-		for (ExecutionJobVertex task : verticesInCreationOrder) {
-			ArchivedExecutionJobVertex archivedTask = task.archive();
-			archivedVerticesInCreationOrder.add(archivedTask);
-			archivedTasks.put(task.getJobVertexId(), archivedTask);
-		}
-
-		Map<String, SerializedValue<Object>> serializedUserAccumulators;
-		try {
-			serializedUserAccumulators = getAccumulatorsSerialized();
-		} catch (Exception e) {
-			LOG.warn("Error occurred while archiving user accumulators.", e);
-			serializedUserAccumulators = Collections.emptyMap();
-		}
-
-		return new ArchivedExecutionGraph(
-			getJobID(),
-			getJobName(),
-			archivedTasks,
-			archivedVerticesInCreationOrder,
-			stateTimestamps,
-			getState(),
-			failureInfo,
-			getJsonPlan(),
-			getAccumulatorResultsStringified(),
-			serializedUserAccumulators,
-			getArchivedExecutionConfig(),
-			isStoppable(),
-			getCheckpointCoordinatorConfiguration(),
-			getCheckpointStatsSnapshot());
 	}
 }
